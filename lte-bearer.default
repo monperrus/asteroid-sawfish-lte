@@ -1,0 +1,22 @@
+# /etc/default/lte-bearer -- configuration for lte-bearer.service
+
+# Carrier APN. internet.tele2.se is the Tele2 SE data APN; the LTE attach
+# APN (4g.tele2.se) is a different context and is not what you want here.
+APN=internet.tele2.se
+
+# 4 = IPv4 only. This modem's IPv6 path is untested.
+IP_TYPE=4
+
+# QMAP mux ID. Must match the rmnet logical endpoint; 1 is the proven value.
+MUX_ID=1
+
+# Which path wins when both are up: wifi or lte. The metric is derived from
+# wlan0's actual default-route metric, because ConnMan uses a near-maximum
+# value here and any hand-picked constant would silently mean "prefer LTE".
+PREFER=wifi
+
+# Override the derived metric entirely, if you would rather pin it.
+#ROUTE_METRIC=1024
+
+# Take over /etc/resolv.conf while the bearer is up, restoring it on stop.
+MANAGE_RESOLV=yes

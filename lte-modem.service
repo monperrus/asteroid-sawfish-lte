@@ -1,0 +1,28 @@
+[Unit]
+Description=Boot the MSM8909 modem (arm firmware, hold subsystem)
+Documentation=file:///usr/share/doc/lte/README.md
+Requires=lte-rmtfs.service
+After=lte-rmtfs.service
+# The disarm service wipes /lib/firmware at every boot to guarantee a safe
+# baseline; we re-arm after it has run, never before.
+After=lte-firmware-disarm.service
+# If rmtfs dies, the modem must come down with it.
+BindsTo=lte-rmtfs.service
+
+[Service]
+# notify, not exec: readiness means "QMI answers", not "the process started".
+Type=notify
+NotifyAccess=all
+# Contain a modem crash instead of resetting the whole SoC. MUST happen
+# before firmware is armed -- this is what fixed the 2026-08-29 reboot loop.
+ExecStartPre=/usr/local/bin/lte-modem-arm
+# Holding /dev/subsys_modem open is what keeps the modem powered
+# (open == subsystem_get). This must be a service, not a scope: a scope is
+# reaped with its invoking shell and silently powers the modem down.
+ExecStart=/usr/local/bin/lte-modem-hold
+ExecStopPost=-/usr/local/bin/lte-modem-disarm
+TimeoutStartSec=120
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -112,9 +112,10 @@ From a host with `adb` access:
 ./install-lte.sh [adb-serial]
 ```
 
-That pushes the shims, `rmtfs`, the four helper scripts, the five units, the
-udev rules and the default config, reloads udev and systemd, and enables the
-disarm service. It is idempotent — re-run it after editing anything.
+That pushes everything in `bin/`, the helper scripts, the five units, the udev
+rules, the default config and this README (to `/usr/share/doc/lte/`), reloads
+udev and systemd, and enables the disarm service. It is idempotent — re-run it
+after editing anything.
 
 The udev rules matter: they create `/dev/modem` (→ `smdcntl0`),
 `/dev/modem-at` (→ `smd8`) and `/dev/qcom_rmtfs_uio1` (→ the `uio` device
@@ -450,18 +451,40 @@ halfway through, leaving routes and `/etc/resolv.conf` behind.
 | `at_cmd.sh` | Sends AT commands to `/dev/modem-at` and prints what comes back. |
 | `send_sms.sh` | One SMS in text mode, including the `>`-prompt/Ctrl-Z dance. |
 | `lte-soak` / `lte-soak@.service` / `lte-soak-report` | The battery A/B measurement. |
-| `rmtfs`, `libqipcrtr4msmipc.so`, `libsmdpkt_wrapper.so` | Cross-built for `armv7vehf-neon`; the first two are patched, see below. |
-| `qmicli-lte`, `msm-rmnet-ctl` | Cross-built. Stock `qmicli` cannot do what the bearer needs. |
+| `bin/rmtfs` | Mainline `rmtfs`, patched. Serves EFS over the IPC router. |
+| `bin/libqipcrtr4msmipc.so` | `AF_QIPCRTR`→`AF_MSM_IPC` shim, patched. This is what lets mainline QMI userspace run on a downstream 3.18 kernel. |
+| `bin/libsmdpkt_wrapper.so` | Unmodified upstream shim. Anything touching `/dev/modem-at` needs it preloaded. |
+| `bin/qmicli-lte` + `bin/libqmi-glib.so.5`, `bin/libqrtr-glib.so.0` | Patched `qmicli`. Stock `qmicli` cannot do what the bearer needs. |
+| `bin/msm-rmnet-ctl` | Reads the BAM pipe pair and switches `rmnet0` to raw-IP. Static. |
+| `src/` | The patched sources and the upstream submissions, see below. |
+
+Everything under `bin/` is cross-built for `armv7vehf-neon`
+(`-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard`) and stripped. The build
+tree they come from is large and regenerable, so it is not checked in — this
+repository's `.gitignore` is deny-by-default for exactly that reason.
 
 ### The patches behind the binaries
 
-| Patch | Why |
-|---|---|
-| `rmtfs`: accept a shared-memory *offset*, not only an absolute address ([PR #41](https://github.com/linux-msm/rmtfs/pull/41)) | this firmware sends `phys_offset=0x200` for sector 1; upstream read it as an absolute address and rejected every EFS transfer |
-| `libqipcrtr4msmipc`: answer `QRTR_TYPE_NEW_LOOKUP`, including wildcard enumeration and the all-zero end-of-dump marker | the original shim supports a service *registering* itself (what `rmtfs` needs) but not a client *looking one up* (what `qrtr-glib` needs) |
-| `libqipcrtr4msmipc`: `ppoll()` readiness plus a one-datagram peek cache | target GLib waits with `ppoll()` and probes with `MSG_PEEK`; AF_MSM_IPC's `MSG_PEEK` is destructive, so `qmicli` lost every immediate response |
-| `libqmi`: separate presence flag for DPM endpoint number 0 | this kernel reports `consumer=0, producer=0`, which stock `qmicli` cannot distinguish from "unset" |
-| `libqmi`: allow `--wds-bind-mux-data-port` and `--wds-start-network` in one invocation | the bind and the call must share one WDS client; this is a local diagnostic patch, not upstream material |
+| Patch | Why | Source |
+|---|---|---|
+| `rmtfs`: accept a shared-memory *offset*, not only an absolute address ([PR #41](https://github.com/linux-msm/rmtfs/pull/41)) | this firmware sends `phys_offset=0x200` for sector 1; upstream read it as an absolute address and rejected every EFS transfer | `src/0003-*.patch`, `src/sharedmem.c` |
+| `libqipcrtr4msmipc`: answer `QRTR_TYPE_NEW_LOOKUP`, including wildcard enumeration and the all-zero end-of-dump marker | the original shim supports a service *registering* itself (what `rmtfs` needs) but not a client *looking one up* (what `qrtr-glib` needs) | `src/0004-*.patch`, `src/libqipcrtr4msmipc.c` |
+| `libqipcrtr4msmipc`: `ppoll()` readiness plus a one-datagram peek cache | target GLib waits with `ppoll()` and probes with `MSG_PEEK`; AF_MSM_IPC's `MSG_PEEK` is destructive, so `qmicli` lost every immediate response | `src/0004-*.patch`, `src/libqipcrtr4msmipc.c` |
+| `libqmi`: separate presence flag for DPM endpoint number 0 | this kernel reports `consumer=0, producer=0`, which stock `qmicli` cannot distinguish from "unset" | `src/0001-*.patch` |
+| `libqmi`: allow `--wds-bind-mux-data-port` and `--wds-start-network` in one invocation | the bind and the call must share one WDS client; this is a local diagnostic patch, not upstream material | `src/0002-*.patch` |
+
+The numbered `src/*.patch` files are the versions proposed upstream;
+`src/sharedmem.c` and `src/libqipcrtr4msmipc.c` are the working sources the
+shipped binaries were actually built from, which say the same thing less
+tidily. `src/msm-rmnet-ctl.c` and `src/Makefile.msm-rmnet-ctl` build
+`bin/msm-rmnet-ctl`:
+
+```sh
+make -f Makefile.msm-rmnet-ctl CC=arm-linux-gnueabihf-gcc LDFLAGS=-static
+```
+
+`src/set-rmnet-llp.c` is the one-ioctl precursor to that tool, kept because
+it is the smallest possible reproduction of the raw-IP fix.
 
 Once QMI works over QRTR, this modem registers its services natively on the
 IPC router (all on node 0): `WDS`→port 42, `DMS`→port 50, `NAS`→port 36,

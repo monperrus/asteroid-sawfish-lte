@@ -1,0 +1,6 @@
+#!/bin/sh
+# Return to the safe baseline: no firmware on disk means the modem cannot
+# boot on its own after a reboot. Mirrors lte-firmware-disarm.service.
+rm -f /lib/firmware/mba.mbn /lib/firmware/modem.*
+mountpoint -q /mnt/modem && umount /mnt/modem
+exit 0

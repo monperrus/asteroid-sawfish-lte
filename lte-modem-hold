@@ -1,0 +1,46 @@
+#!/bin/sh
+# Keep the modem powered by holding /dev/subsys_modem open (open ==
+# subsystem_get), and do not report readiness until the modem is genuinely
+# usable. Main process of lte-modem.service (Type=notify).
+STATE=/sys/bus/msm_subsys/devices/subsys2/state
+CRASHES=/sys/bus/msm_subsys/devices/subsys2/crash_count
+QMICLI=/usr/local/bin/qmicli-lte
+
+export LD_LIBRARY_PATH=/usr/local/lib/lte
+export LD_PRELOAD=/usr/local/lib/lte/libqipcrtr4msmipc.so
+
+exec 3< /dev/subsys_modem || exit 1
+
+# `state` flips to ONLINE almost immediately, well before the modem has
+# registered its QMI services on the QRTR bus. Waiting on it alone starts
+# the bearer into an empty bus: "node with id 0 not found in QRTR bus".
+i=0
+while [ "$(cat "$STATE" 2>/dev/null)" != ONLINE ]; do
+    i=$((i + 1))
+    [ "$i" -gt 60 ] && { echo "modem did not reach ONLINE" >&2; exit 1; }
+    sleep 1
+done
+
+# The real readiness condition: DMS answers over QRTR. This is what the
+# bearer needs, so this is what we gate on.
+i=0
+until "$QMICLI" -d qrtr://0 --dms-get-ids >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -gt 90 ] && { echo "modem ONLINE but QMI never came up" >&2; exit 1; }
+    [ "$(cat "$STATE" 2>/dev/null)" = ONLINE ] || {
+        echo "modem went OFFLINE while waiting for QMI" >&2; exit 1; }
+    sleep 2
+done
+
+# A freshly booted modem sits in a low-power/'shutting-down' operating mode
+# and will never attach to the network. Nothing else reports this clearly:
+# the bearer just fails with 'generic-no-service' 120s later. Idempotent.
+if ! "$QMICLI" -d qrtr://0 --dms-set-operating-mode=online >/dev/null 2>&1; then
+    echo "warning: could not set operating mode online" >&2
+fi
+
+echo "modem ready: QMI up after ${i} polls (crash_count=$(cat "$CRASHES" 2>/dev/null))"
+systemd-notify --ready --status="modem ONLINE, QMI up" 2>/dev/null || true
+
+# Hold the fd for the lifetime of the unit.
+exec sleep infinity

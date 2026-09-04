@@ -1,0 +1,28 @@
+#!/bin/sh
+# Arm the modem: contain crashes, then put firmware in place.
+# Run as root, before lte-modem-hold. See README.md.
+set -e
+
+SUBSYS=/sys/devices/platform/soc/4080000.qcom,mss/subsys2
+FWSRC=/mnt/modem/image
+FWDST=/lib/firmware
+
+# 1. Contain a modem crash instead of resetting the SoC. This MUST be set
+#    before firmware is armed -- with the default SYSTEM, an ordinary modem
+#    crash reboots the whole watch, which is the 2026-08-29 reboot loop.
+if [ -w "$SUBSYS/restart_level" ]; then
+    echo RELATED > "$SUBSYS/restart_level"
+    [ "$(cat "$SUBSYS/restart_level")" = RELATED ] || {
+        echo "refusing to arm: restart_level is not RELATED" >&2; exit 1; }
+else
+    echo "refusing to arm: $SUBSYS/restart_level not writable" >&2; exit 1
+fi
+
+# 2. Firmware comes from the stock ROM's modem partition, which we never
+#    modify -- mounted read-only.
+mkdir -p /mnt/modem
+mountpoint -q /mnt/modem || mount -o ro /dev/disk/by-partlabel/modem /mnt/modem
+
+mkdir -p "$FWDST"
+cp "$FWSRC/mba.mbn" "$FWSRC/modem.mdt" "$FWDST/"
+cp "$FWSRC"/modem.b* "$FWDST/"

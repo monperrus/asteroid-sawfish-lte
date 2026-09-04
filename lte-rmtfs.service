@@ -1,0 +1,20 @@
+[Unit]
+Description=rmtfs (EFS storage service for the LTE modem)
+Documentation=file:///usr/share/doc/lte/README.md
+# rmtfs MUST be serving before the modem boots, or the modem fails EFS
+# bring-up and enters a contained restart loop. See NOTES.md 2026-08-30.
+Before=lte-modem.service
+ConditionPathExists=/dev/qcom_rmtfs_uio1
+
+[Service]
+Type=exec
+Environment=LD_PRELOAD=/usr/local/lib/lte/libqipcrtr4msmipc.so
+ExecStart=/usr/local/bin/lte-rmtfs -P -r -v
+Restart=no
+# Deliberately Restart=no: restarting rmtfs under a live modem forces a
+# contained modem crash, and the fresh instance misses the EFS requests the
+# modem makes during its restart. Recovery is stop-everything-and-replay,
+# which lte-modem.service handles by being bound to this unit.
+
+[Install]
+WantedBy=multi-user.target

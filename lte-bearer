@@ -1,0 +1,276 @@
+#!/bin/sh
+# Bring up the LTE IPv4 data bearer and hold it. Main process of
+# lte-bearer.service. Requires the modem already ONLINE (lte-modem.service).
+#
+# The proven sequence, and why each step exists, is in README.md. In short:
+# DPM opens the BAM-DMUX control port (which creates rmnet0), WDA agrees the
+# QMAP/raw-IP framing, rmnetcli builds the mux-1 logical endpoint pair, and a
+# single long-lived qmicli process binds the mux and starts the WDS call --
+# the bind and the call MUST live in one process, because the QMI client is
+# dropped when that process exits.
+set -e
+
+APN="${APN:-internet.tele2.se}"
+IP_TYPE="${IP_TYPE:-4}"
+MUX_ID="${MUX_ID:-1}"
+PREFER="${PREFER:-wifi}"
+ROUTE_METRIC="${ROUTE_METRIC:-}"
+MANAGE_RESOLV="${MANAGE_RESOLV:-yes}"
+PHYS="${PHYS:-rmnet0}"
+VND="${VND:-rmnet_data0}"
+
+QMICLI=/usr/local/bin/qmicli-lte
+RMNETCTL=/usr/local/bin/msm-rmnet-ctl
+# The stock ROM's Android binary. It must be run with our glibc LD_PRELOAD
+# and LD_LIBRARY_PATH stripped: preloading a glibc shim into a bionic binary
+# aborts it instantly (SIGABRT, "core dumped", no useful message).
+RMNETCLI="env -u LD_PRELOAD -u LD_LIBRARY_PATH /system/bin/rmnetcli"
+RESOLV_MARK="# written by lte-bearer"
+RESOLV_RUN=/run/lte-resolv.conf
+RESOLV_SAVE=/run/lte-resolv.saved
+RESOLV_SAVE_LINK=/run/lte-resolv.saved.link
+STATEDIR=/run/lte-bearer
+QRTR=qrtr://0
+
+export LD_LIBRARY_PATH=/usr/local/lib/lte
+export LD_PRELOAD=/usr/local/lib/lte/libqipcrtr4msmipc.so
+
+log() { echo "lte-bearer: $*"; }
+
+mask2prefix() {
+    # 255.255.255.252 -> 30
+    echo "$1" | awk -F. '{
+        c = 0
+        for (i = 1; i <= 4; i++) { n = $i; while (n > 0) { c += n % 2; n = int(n / 2) } }
+        print c
+    }'
+}
+
+teardown() {
+    log "tearing down"
+    ip route del default via "$GW" dev "$VND" metric "$ROUTE_METRIC" 2>/dev/null || true
+    for d in $DNS1 $DNS2; do
+        ip route del "$d/32" via "$GW" dev "$VND" 2>/dev/null || true
+    done
+    ip addr flush dev "$VND" 2>/dev/null || true
+    ip link set "$VND" down 2>/dev/null || true
+    if [ "$MANAGE_RESOLV" = yes ]; then
+        if [ -e "$RESOLV_SAVE_LINK" ]; then
+            # It was a symlink: put the symlink back, pointing where it did.
+            ln -sfn "$(cat "$RESOLV_SAVE_LINK")" /etc/resolv.conf 2>/dev/null || true
+            rm -f "$RESOLV_SAVE_LINK"
+        elif [ -e "$RESOLV_SAVE" ]; then
+            rm -f /etc/resolv.conf
+            cp -a "$RESOLV_SAVE" /etc/resolv.conf 2>/dev/null || true
+            rm -f "$RESOLV_SAVE"
+        elif [ -L /etc/resolv.conf ] && [ "$(readlink /etc/resolv.conf)" = "$RESOLV_RUN" ]; then
+            # Ours, but with no record of what preceded it (an earlier run
+            # left the symlink behind). Fall back to ConnMan's resolver if
+            # this image has one, rather than leaving a stale LTE file.
+            if [ -e /run/connman/resolv.conf ]; then
+                ln -sfn /run/connman/resolv.conf /etc/resolv.conf 2>/dev/null || true
+            else
+                log "no saved resolver to restore; leaving $RESOLV_RUN in place"
+            fi
+        fi
+    fi
+    # qmicli stops the call on SIGINT ("Ctrl+C will stop the network"); it
+    # ignores SIGTERM, which is why a plain stop used to hang the unit in
+    # `deactivating` until systemd's timeout SIGKILLed it.
+    if [ -n "$QPID" ] && kill -0 "$QPID" 2>/dev/null; then
+        kill -INT "$QPID" 2>/dev/null || true
+        i=0
+        while kill -0 "$QPID" 2>/dev/null; do
+            i=$((i + 1)); [ "$i" -gt 15 ] && { kill -KILL "$QPID" 2>/dev/null; break; }
+            sleep 1
+        done
+    fi
+    rm -rf "$STATEDIR"
+}
+
+# A deliberate `systemctl stop` must not leave the unit in `failed`: exit 0
+# on a signal, and reserve a non-zero exit for the call dropping on its own
+# (which is what should trigger Restart=on-failure).
+trap 'log "stopping on signal"; exit 0' INT TERM
+trap teardown EXIT
+
+mkdir -p "$STATEDIR"
+
+# --- 1. DPM: open the control port. This is what makes rmnet0 appear. -----
+# The vendor netmgr_config.xml calls this SoC the 'feero' profile: control
+# port DATA5_CNTL, hardware endpoint bam-dmux iface 0, pipe pair 0/0 (the
+# kernel reports 0/0 via msm-rmnet-ctl get-endpoints -- do not guess 4/5).
+if ! ip link show "$PHYS" >/dev/null 2>&1; then
+    log "opening DPM control port DATA5_CNTL"
+    "$QMICLI" -d "$QRTR" --client-no-release-cid \
+      --dpm-open-port="ctrl-ep-type=bam-dmux,ctrl-ep-iface-number=0,ctrl-port-name=DATA5_CNTL,hw-data-ep-type=bam-dmux,hw-data-ep-iface-number=0,hw-data-rx-id=0,hw-data-tx-id=0" \
+      >"$STATEDIR/dpm.log" 2>&1 || { cat "$STATEDIR/dpm.log" >&2; exit 1; }
+    i=0
+    while ! ip link show "$PHYS" >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -gt 20 ] && { log "$PHYS never appeared"; exit 1; }
+        sleep 1
+    done
+fi
+
+# --- 2. raw-IP link layer ------------------------------------------------
+# BAM-DMUX delivers raw QMAP. While rmnet0 claims to be Ethernet the network
+# core eats 14 bytes off every downlink frame before rmnet's ingress handler
+# sees it, and every reply is silently lost. This ioctl is not optional.
+"$RMNETCTL" set-raw-ip "$PHYS"
+
+# --- 3. WDA: agree the data format --------------------------------------
+# ep-type MUST be bam-dmux to match DPM. qmicli's --help text for
+# --wda-set-data-format omits bam-dmux, but the parser accepts it.
+log "setting WDA data format"
+"$QMICLI" -d "$QRTR" \
+  --wda-set-data-format="link-layer-protocol=raw-ip,ul-protocol=qmap,dl-protocol=qmap,dl-datagram-max-size=2048,dl-max-datagrams=1,ep-type=bam-dmux,ep-iface-number=0" \
+  >"$STATEDIR/wda.log" 2>&1 || { cat "$STATEDIR/wda.log" >&2; exit 1; }
+
+# --- 4. rmnet: mux + demux, logical endpoint MUX_ID ----------------------
+# Flags 10 = MAP + muxing, no aggregation, no checksum offload. Do NOT turn
+# on checksum-v4: this kernel returns ERR_BAD_BUFFER for it.
+rmnet() {
+    # Tolerate "already configured" on a re-run, but keep the output: a
+    # silent || true here is how a SIGABRT went unnoticed for an hour.
+    out=$($RMNETCLI "$@" 2>&1) || true
+    case "$out" in
+        *SUCCESS*) : ;;
+        *) log "rmnetcli $*: ${out:-no output}" ;;
+    esac
+}
+
+if ! ip link show "$VND" >/dev/null 2>&1; then
+    log "configuring rmnet mux $MUX_ID"
+    rmnet assocnetdev "$PHYS"
+    rmnet setledf 10 0 0 "$PHYS"
+    rmnet setlidf 10 0 "$PHYS"
+    rmnet newvnd 0
+    rmnet setlepc "$MUX_ID" 1 "$PHYS" "$VND"
+    rmnet setlepc "$MUX_ID" 1 "$VND" "$PHYS"
+fi
+ip link show "$VND" >/dev/null 2>&1 || { log "$VND was not created"; exit 1; }
+ip link set "$PHYS" up
+ip link set "$VND" up
+
+# rmnet0 is a raw QMAP transport, not an IP interface. ConnMan (and avahi)
+# see a new link appear and give it a 169.254/16 link-local address plus a
+# `default dev rmnet0 scope link` route -- at metric 0, which beats every
+# real default route and black-holes all traffic onto an interface that
+# cannot carry IP. Strip it, and keep stripping it: the daemons re-add it.
+phys_hygiene() {
+    ip route del default dev "$PHYS" 2>/dev/null || true
+    ip -4 addr flush dev "$PHYS" 2>/dev/null || true
+}
+phys_hygiene
+
+# --- 4b. Wait for network registration -----------------------------------
+# The modem reaches ONLINE and answers QMI a good while before it has
+# actually attached to the network. Starting the call too early fails with
+# QMI error 14 'CallFailed' / call end reason 3 'generic-no-service', which
+# reads like a configuration fault but is only impatience.
+log "waiting for network registration"
+i=0
+until "$QMICLI" -d "$QRTR" --nas-get-serving-system 2>/dev/null \
+        | grep -q "Registration state: 'registered'"; do
+    i=$((i + 1))
+    [ "$i" -gt 60 ] && { log "not registered after 120s"; exit 1; }
+    sleep 2
+done
+log "registered after $((i * 2))s"
+
+# --- 5. WDS: bind the mux and start the call, in ONE process -------------
+# A second process cannot query this call: its own client gets 'OutOfCall',
+# and a CID from an exited process is 'Unknown client'. So the settings are
+# read from this process's own output as it prints them.
+log "starting WDS call on apn=$APN"
+rm -f "$STATEDIR/wds.log"
+: > "$STATEDIR/wds.log"
+"$QMICLI" -d "$QRTR" \
+  --wds-bind-mux-data-port="mux-id=$MUX_ID,ep-type=bam-dmux,ep-iface-number=0" \
+  --wds-start-network="apn=$APN,ip-type=$IP_TYPE" \
+  --wds-follow-network >>"$STATEDIR/wds.log" 2>&1 &
+QPID=$!
+
+# --- 6. Wait for the settings the call prints, then apply them -----------
+i=0
+while :; do
+    IP=$(awk -F': *' '/IPv4 address:/    {print $2; exit}' "$STATEDIR/wds.log")
+    [ -n "$IP" ] && break
+    i=$((i + 1))
+    [ "$i" -gt 90 ] && { log "no IPv4 settings after 90s"; cat "$STATEDIR/wds.log" >&2; exit 1; }
+    kill -0 "$QPID" 2>/dev/null || { log "qmicli exited early"; cat "$STATEDIR/wds.log" >&2; exit 1; }
+    sleep 1
+done
+
+MASK=$(awk -F': *' '/IPv4 subnet mask:/    {print $2; exit}' "$STATEDIR/wds.log")
+GW=$(  awk -F': *' '/IPv4 gateway address:/{print $2; exit}' "$STATEDIR/wds.log")
+DNS1=$(awk -F': *' '/IPv4 primary DNS:/    {print $2; exit}' "$STATEDIR/wds.log")
+DNS2=$(awk -F': *' '/IPv4 secondary DNS:/  {print $2; exit}' "$STATEDIR/wds.log")
+MTU=$( awk -F': *' '/MTU:/                 {print $2; exit}' "$STATEDIR/wds.log")
+PREFIX=$(mask2prefix "${MASK:-255.255.255.252}")
+
+log "address=$IP/$PREFIX gateway=$GW dns=$DNS1,$DNS2 mtu=${MTU:-1500}"
+
+ip addr flush dev "$VND"
+ip addr add "$IP/$PREFIX" dev "$VND"
+ip link set "$VND" up mtu "${MTU:-1500}"
+
+# Route preference. ConnMan gives wlan0 an enormous metric (~4294961151 on
+# this image), so a "sensible" fixed number like 500 silently makes LTE the
+# primary path. Derive the metric from wlan0's actual metric instead, so
+# PREFER means what it says.
+if [ -z "$ROUTE_METRIC" ]; then
+    WIFI_METRIC=$(ip route show default dev wlan0 2>/dev/null \
+                  | awk '{for (i = 1; i < NF; i++) if ($i == "metric") print $(i+1)}' \
+                  | head -1)
+    if [ -n "$WIFI_METRIC" ] && [ "$PREFER" = wifi ]; then
+        ROUTE_METRIC=$((WIFI_METRIC + 1))
+    elif [ -n "$WIFI_METRIC" ] && [ "$WIFI_METRIC" -gt 1 ]; then
+        ROUTE_METRIC=$((WIFI_METRIC - 1))
+    else
+        ROUTE_METRIC=1024
+    fi
+fi
+log "default route metric $ROUTE_METRIC (prefer=$PREFER, wlan0=${WIFI_METRIC:-none})"
+ip route replace default via "$GW" dev "$VND" metric "$ROUTE_METRIC"
+for d in $DNS1 $DNS2; do
+    [ -n "$d" ] && ip route replace "$d/32" via "$GW" dev "$VND"
+done
+
+# --- 7. Resolver ---------------------------------------------------------
+# ConnMan and systemd-resolved both want /etc/resolv.conf on this image and
+# conflict; rather than join that fight, save the current target and put it
+# back on teardown.
+if [ "$MANAGE_RESOLV" = yes ] && [ -n "$DNS1" ]; then
+    { echo "$RESOLV_MARK"
+      echo "nameserver $DNS1"
+      [ -n "$DNS2" ] && echo "nameserver $DNS2"; } > "$RESOLV_RUN"
+    # Save the pre-existing resolver exactly once. /etc/resolv.conf is a
+    # SYMLINK on this image, so record the link target rather than copying
+    # the link -- copying it saves a pointer to our own file and loses the
+    # original entirely.
+    if [ ! -e "$RESOLV_SAVE" ] && [ ! -e "$RESOLV_SAVE_LINK" ]; then
+        if [ -L /etc/resolv.conf ]; then
+            target=$(readlink /etc/resolv.conf)
+            [ "$target" = "$RESOLV_RUN" ] || echo "$target" > "$RESOLV_SAVE_LINK"
+        elif [ -e /etc/resolv.conf ] \
+             && ! grep -q "$RESOLV_MARK" /etc/resolv.conf 2>/dev/null; then
+            cp -a /etc/resolv.conf "$RESOLV_SAVE" 2>/dev/null || true
+        fi
+    fi
+    ln -sfn "$RESOLV_RUN" /etc/resolv.conf 2>/dev/null || true
+fi
+
+systemd-notify --ready --status="bearer up: $IP via $GW" 2>/dev/null || true
+log "bearer up"
+
+# Track the call for as long as it lives; exiting here tears the bearer down
+# and lets systemd restart the unit. While waiting, keep re-asserting that
+# rmnet0 carries no IP configuration.
+while kill -0 "$QPID" 2>/dev/null; do
+    phys_hygiene
+    sleep 30
+done
+wait "$QPID"
+log "qmicli exited, bearer down"
+exit 1

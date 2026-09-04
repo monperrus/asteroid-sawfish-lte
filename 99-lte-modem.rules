@@ -1,0 +1,3 @@
+KERNEL=="smdcntl0", SUBSYSTEM=="smdpkt", SYMLINK+="modem", ENV{OFONO_DRIVER}="gobi"
+KERNEL=="smd8", SYMLINK+="modem-at"
+SUBSYSTEM=="uio", ATTR{name}=="rmtfs", SYMLINK+="qcom_rmtfs_uio1"

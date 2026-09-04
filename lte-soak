@@ -1,0 +1,93 @@
+#!/bin/sh
+# Battery/wake-lock soak sampler. See "The battery soak" in README.md.
+# Usage: lte-soak <label>        e.g. lte-soak modem-up
+#
+# Runs entirely on the watch and writes one CSV plus two wakeup_sources
+# snapshots. Do NOT drive this over SSH in a loop: the polling itself keeps
+# the device awake and is exactly the thing being measured.
+#
+# SOAK_INTERVAL is a lower bound, not a cadence. The device suspends, and
+# timers do not fire until something else wakes it: a 120 s interval measured
+# a ~16 min median gap in practice. That is correct behaviour -- forcing
+# wakeups to sample on schedule would measure the sampler. All rates are
+# computed from the recorded timestamps, so sparse samples are still sound.
+set -e
+
+LABEL="${1:-unlabelled}"
+INTERVAL="${SOAK_INTERVAL:-60}"
+DURATION="${SOAK_DURATION:-7200}"
+OUTDIR="${SOAK_OUTDIR:-/home/ceres/soak}"
+
+PS=/sys/class/power_supply
+SUBSYS=/sys/bus/msm_subsys/devices/subsys2
+WAKEUP=/sys/kernel/debug/wakeup_sources
+
+STAMP=$(date +%Y%m%d-%H%M%S)
+BASE="$OUTDIR/soak-$LABEL-$STAMP"
+CSV="$BASE.csv"
+
+mkdir -p "$OUTDIR"
+
+r() { cat "$1" 2>/dev/null || echo ""; }
+
+# A soak on the charger measures nothing. Refuse rather than produce a
+# plausible-looking file full of noise.
+if [ "${SOAK_FORCE:-0}" != "1" ] \
+   && { [ "$(r $PS/usb/present)" = "1" ] || [ "$(r $PS/battery/status)" = "Charging" ]; }; then
+    echo "refusing to soak: the watch is on the charger" >&2
+    echo "  usb/present=$(r $PS/usb/present) status=$(r $PS/battery/status)" >&2
+    echo "  (SOAK_FORCE=1 overrides, for dry runs only -- the numbers will be junk)" >&2
+    exit 1
+fi
+
+cp "$WAKEUP" "$BASE.wakeup.start" 2>/dev/null || true
+
+# A soak often ends abruptly -- flat battery, a low-battery shutdown, someone
+# stopping the unit. Write the closing snapshot on the way out rather than
+# only after a full-length run, and keep refreshing a recent one in case the
+# process is killed outright.
+finish() {
+    cp "$WAKEUP" "$BASE.wakeup.end" 2>/dev/null || true
+    echo "soak ended: $CSV"
+}
+trap 'finish; exit 0' INT TERM
+
+echo "label=$LABEL interval=${INTERVAL}s duration=${DURATION}s -> $CSV"
+echo "ts,iso,uptime_s,capacity,charge_now,voltage_now,current_now,current_avg,temp,status,usb,modem_state,crash_count,bearer,rmnet_rx,rmnet_tx" > "$CSV"
+
+END=$(( $(date +%s) + DURATION ))
+while [ "$(date +%s)" -lt "$END" ]; do
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "$(date +%s)" "$(date -Iseconds)" \
+        "$(cut -d. -f1 /proc/uptime)" \
+        "$(r $PS/battery/capacity)" \
+        "$(r $PS/bms/charge_now)" \
+        "$(r $PS/bms/voltage_now)" \
+        "$(r $PS/bms/current_now)" \
+        "$(r $PS/bms/current_avg)" \
+        "$(r $PS/battery/temp)" \
+        "$(r $PS/battery/status)" \
+        "$(r $PS/usb/present)" \
+        "$(r $SUBSYS/state)" \
+        "$(r $SUBSYS/crash_count)" \
+        "$(systemctl is-active lte-bearer 2>/dev/null)" \
+        "$(r /sys/class/net/rmnet_data0/statistics/rx_bytes)" \
+        "$(r /sys/class/net/rmnet_data0/statistics/tx_bytes)" \
+        >> "$CSV"
+
+    # Stop early rather than silently logging charger-fed samples.
+    if [ "$(r $PS/usb/present)" = "1" ] && [ "${SOAK_FORCE:-0}" != "1" ]; then
+        echo "charger plugged in at $(date -Iseconds); soak aborted" >&2
+        echo "# ABORTED: charger connected" >> "$CSV"
+        cp "$WAKEUP" "$BASE.wakeup.end" 2>/dev/null || true
+        exit 1
+    fi
+    # Refresh a recent snapshot every ~10 samples, so an abrupt end still
+    # leaves something to diff against the start.
+    n=$((${n:-0} + 1))
+    [ $((n % 10)) -eq 0 ] && cp "$WAKEUP" "$BASE.wakeup.last" 2>/dev/null || true
+
+    sleep "$INTERVAL"
+done
+
+finish

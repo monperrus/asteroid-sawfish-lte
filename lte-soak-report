@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Compare two LTE battery soak runs. See "The battery soak" in README.md.
+
+Usage:  lte-soak-report <baseline.csv> <modem-up.csv>
+
+Reports drain per hour for each run and diffs the wakeup_sources snapshots
+that sit beside each CSV, so a wake-lock regression shows up by name.
+"""
+from __future__ import annotations
+
+import csv
+import sys
+from pathlib import Path
+
+
+def load(path: Path) -> list[dict[str, str]]:
+    with path.open() as fh:
+        rows = [r for r in csv.DictReader(fh) if r.get("ts", "").isdigit()]
+    if len(rows) < 2:
+        sys.exit(f"{path}: need at least 2 samples, got {len(rows)}")
+    return rows
+
+
+def num(row: dict[str, str], key: str) -> float | None:
+    try:
+        return float(row[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def summarize(path: Path) -> dict:
+    rows = load(path)
+    first, last = rows[0], rows[-1]
+    hours = (int(last["ts"]) - int(first["ts"])) / 3600.0
+    if hours <= 0:
+        sys.exit(f"{path}: zero-length run")
+
+    out = {
+        "path": path,
+        "samples": len(rows),
+        "hours": hours,
+        "capacity_start": num(first, "capacity"),
+        "capacity_end": num(last, "capacity"),
+        "charge_start": num(first, "charge_now"),
+        "charge_end": num(last, "charge_now"),
+        "modem": last.get("modem_state", "?"),
+        "bearer": last.get("bearer", "?"),
+        "crashes": num(last, "crash_count"),
+        "aborted": any(r.get("usb") == "1" for r in rows),
+    }
+
+    cur = [c for c in (num(r, "current_now") for r in rows) if c is not None]
+    # current_now is reported in microamps; discharge may be signed either way.
+    out["current_mA"] = (sum(abs(c) for c in cur) / len(cur) / 1000.0) if cur else None
+
+    if out["capacity_start"] is not None and out["capacity_end"] is not None:
+        out["pct_per_h"] = (out["capacity_start"] - out["capacity_end"]) / hours
+    else:
+        out["pct_per_h"] = None
+
+    if out["charge_start"] is not None and out["charge_end"] is not None:
+        out["charge_per_h"] = (out["charge_start"] - out["charge_end"]) / hours
+    else:
+        out["charge_per_h"] = None
+
+    rx = num(last, "rmnet_rx") or 0
+    tx = num(last, "rmnet_tx") or 0
+    rx0 = num(first, "rmnet_rx") or 0
+    tx0 = num(first, "tx") if "tx" in first else num(first, "rmnet_tx") or 0
+    out["lte_bytes"] = (rx - rx0) + (tx - tx0)
+    return out
+
+
+def wakeups(csv_path: Path) -> dict[str, int]:
+    """active_since deltas per wakeup source, start -> end."""
+    base = str(csv_path)[: -len(".csv")] if str(csv_path).endswith(".csv") else str(csv_path)
+    snaps = {}
+    for which in ("start", "end"):
+        p = Path(f"{base}.wakeup.{which}")
+        if which == "end" and not p.exists():
+            # An abrupt end (flat battery, killed unit) leaves no .end; fall
+            # back to the periodic snapshot so the run is still usable.
+            p = Path(f"{base}.wakeup.last")
+        table: dict[str, int] = {}
+        if p.exists():
+            for line in p.read_text().splitlines()[1:]:
+                f = line.split()
+                if len(f) >= 7:
+                    try:
+                        table[f[0]] = int(f[6])  # active_since
+                    except ValueError:
+                        pass
+        snaps[which] = table
+    start, end = snaps["start"], snaps["end"]
+    return {k: end[k] - start.get(k, 0) for k in end if end[k] - start.get(k, 0) > 0}
+
+
+def fmt(v, unit="", nd=2):
+    return "n/a" if v is None else f"{v:.{nd}f}{unit}"
+
+
+def main() -> None:
+    if len(sys.argv) != 3:
+        sys.exit(__doc__)
+    a, b = summarize(Path(sys.argv[1])), summarize(Path(sys.argv[2]))
+
+    print(f"{'':22} {'baseline':>18} {'modem up':>18}")
+    print("-" * 60)
+    rows = [
+        ("samples", str(a["samples"]), str(b["samples"])),
+        ("duration", fmt(a["hours"], " h"), fmt(b["hours"], " h")),
+        ("battery start", fmt(a["capacity_start"], " %", 0), fmt(b["capacity_start"], " %", 0)),
+        ("battery end", fmt(a["capacity_end"], " %", 0), fmt(b["capacity_end"], " %", 0)),
+        ("drain", fmt(a["pct_per_h"], " %/h"), fmt(b["pct_per_h"], " %/h")),
+        ("charge drain", fmt(a["charge_per_h"], "/h"), fmt(b["charge_per_h"], "/h")),
+        ("mean current", fmt(a["current_mA"], " mA"), fmt(b["current_mA"], " mA")),
+        ("modem state", a["modem"], b["modem"]),
+        ("bearer", a["bearer"], b["bearer"]),
+        ("crash_count", fmt(a["crashes"], "", 0), fmt(b["crashes"], "", 0)),
+        ("LTE bytes", fmt(a["lte_bytes"], "", 0), fmt(b["lte_bytes"], "", 0)),
+    ]
+    for label, x, y in rows:
+        print(f"{label:22} {x:>18} {y:>18}")
+
+    if a["aborted"] or b["aborted"]:
+        print("\n!! a run saw the charger connected -- its numbers are meaningless")
+
+    if a["pct_per_h"] and b["pct_per_h"]:
+        delta = b["pct_per_h"] - a["pct_per_h"]
+        ratio = b["pct_per_h"] / a["pct_per_h"] if a["pct_per_h"] else float("inf")
+        print(f"\nregression: {delta:+.2f} %/h ({ratio:.2f}x baseline)")
+
+    wa, wb = wakeups(Path(sys.argv[1])), wakeups(Path(sys.argv[2]))
+    if wa or wb:
+        print("\nwakeup sources active during the run (ms, top 12 by modem-up):")
+        keys = sorted(set(wa) | set(wb), key=lambda k: -wb.get(k, 0))[:12]
+        print(f"  {'source':32} {'baseline':>12} {'modem up':>12}")
+        for k in keys:
+            print(f"  {k:32} {wa.get(k, 0):>12} {wb.get(k, 0):>12}")
+
+
+if __name__ == "__main__":
+    main()

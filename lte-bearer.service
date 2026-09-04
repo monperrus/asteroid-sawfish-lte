@@ -1,0 +1,23 @@
+[Unit]
+Description=LTE IPv4 data bearer (DPM/WDA/rmnet + WDS call)
+Documentation=file:///usr/share/doc/lte/README.md
+Requires=lte-modem.service
+After=lte-modem.service
+BindsTo=lte-modem.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+EnvironmentFile=-/etc/default/lte-bearer
+ExecStart=/usr/local/bin/lte-bearer
+# mixed, not the default control-group: systemd must signal only the script,
+# which then stops the qmicli child itself. Otherwise the teardown is killed
+# halfway through and leaves routes and resolv.conf behind.
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=30
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

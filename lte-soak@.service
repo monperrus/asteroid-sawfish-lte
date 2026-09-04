@@ -1,0 +1,12 @@
+[Unit]
+Description=LTE battery soak sampler (%i)
+Documentation=file:///usr/share/doc/lte/README.md
+
+[Service]
+Type=oneshot
+Environment=SOAK_INTERVAL=60
+Environment=SOAK_DURATION=7200
+ExecStart=/usr/local/bin/lte-soak %i
+# The sampler must not be what keeps the device awake.
+Nice=10
+TimeoutStartSec=infinity

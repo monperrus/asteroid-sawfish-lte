@@ -1,0 +1,520 @@
+From 9d9be7e5e9a12b2c7822b5235e2a2442ff0063f8 Mon Sep 17 00:00:00 2001
+From: Martin Monperrus <martin.monperrus@gnieh.org>
+Date: Sun, 30 Aug 2026 18:58:31 +0200
+Subject: [PATCH] support QRTR client lookups on MSM IPC
+
+---
+ Makefile |   2 +-
+ main.c   | 422 +++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 409 insertions(+), 15 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index baf04ec..a64d1de 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,4 +1,4 @@
+-CFLAGS=-std=c99 -Wall -Wextra -Werror
++CFLAGS=-std=c99 -Wall -Wextra -Werror -fPIC -pthread
+ 
+ libqipcrtr4msmipc.so: main.c
+ 	gcc $(CFLAGS) -shared $< -o $@
+diff --git a/main.c b/main.c
+index b023fb0..b74e028 100644
+--- a/main.c
++++ b/main.c
+@@ -24,10 +24,15 @@
+ #include <linux/qrtr.h>
+ 
+ #include <dlfcn.h>
++#include <errno.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <signal.h>
++#include <unistd.h>
+ 
+ #define IPC_ROUTER_NID_LOCAL            1 /* from ipc_router.h in MSM kernel fork */
+ 
+@@ -48,6 +53,11 @@ static int (*real_bind)(int sockfd, const struct sockaddr *addr, socklen_t addrl
+ static int (*real_getsockname)(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+ static ssize_t (*real_sendto)(int sockfd, const void *buf, size_t len, int flags, const struct sockaddr *, socklen_t);
+ static ssize_t (*real_recvfrom)(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen);
++static ssize_t (*real_recvmsg)(int sockfd, struct msghdr *msg, int flags);
++static ssize_t (*real_recv)(int sockfd, void *buf, size_t len, int flags);
++static int (*real_poll)(struct pollfd *fds, nfds_t nfds, int timeout);
++static int (*real_ppoll)(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout, const sigset_t *sigmask);
++static int (*real_close)(int fd);
+ 
+ #define LOAD_DLSYM(n) do { real_##n = dlsym(RTLD_NEXT, #n); } while(0)
+ __attribute__ ((__constructor__)) static void init() {
+@@ -56,15 +66,79 @@ __attribute__ ((__constructor__)) static void init() {
+ 	LOAD_DLSYM(getsockname);
+ 	LOAD_DLSYM(sendto);
+ 	LOAD_DLSYM(recvfrom);
++	LOAD_DLSYM(recvmsg);
++	LOAD_DLSYM(recv);
++	LOAD_DLSYM(poll);
++	LOAD_DLSYM(ppoll);
++	LOAD_DLSYM(close);
+ }
+ 
+ /* state storage */
+-// TODO store on per-socket basis; for now we assume only one socket per program
+-static uint32_t g_service = 0, g_instance = 0;
++#define MAX_SOCKET_STATES 32
++#define MAX_QMI_SERVICE 255
++#define MAX_PENDING_LOOKUP_REPLIES (MAX_QMI_SERVICE + 1)
++#define MAX_PEEKED_MESSAGE_SIZE 65536
++#define NO_QUEUED_DATAGRAM -2
++
++struct socket_state {
++	int in_use;
++	int lock_initialized;
++	int fd;
++	pthread_mutex_t lock;
++	uint32_t service;
++	uint32_t instance;
++	struct qrtr_ctrl_pkt pending[MAX_PENDING_LOOKUP_REPLIES];
++	size_t pending_head;
++	size_t pending_count;
++	unsigned char peeked[MAX_PEEKED_MESSAGE_SIZE];
++	ssize_t peeked_size;
++	struct sockaddr_qrtr peeked_source;
++};
++
++static pthread_mutex_t states_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct socket_state states[MAX_SOCKET_STATES];
++
++static struct socket_state *get_socket_state(int fd, int create)
++{
++	struct socket_state *free_state = NULL;
++	struct socket_state *state = NULL;
++
++	pthread_mutex_lock(&states_lock);
++	for (size_t i = 0; i < MAX_SOCKET_STATES; i++) {
++		if (states[i].in_use && states[i].fd == fd) {
++			state = &states[i];
++			break;
++		}
++		if (!states[i].in_use && !free_state)
++			free_state = &states[i];
++	}
++
++	if (!state && create && free_state) {
++		state = free_state;
++		state->in_use = 1;
++		state->fd = fd;
++		if (!state->lock_initialized) {
++			pthread_mutex_init(&state->lock, NULL);
++			state->lock_initialized = 1;
++		}
++	}
++	pthread_mutex_unlock(&states_lock);
++	return state;
++}
++
++/*
++ * AF_MSM_IPC has no QRTR nameserver socket. Client lookups are therefore
++ * answered from IPC_ROUTER_IOCTL_LOOKUP_SERVER and queued as synthetic QRTR
++ * control packets on the requesting socket.
++ */
+ 
+ /* intercepted functions */
+ int socket(int domain, int type, int protocol) {
+-	return real_socket(domain != AF_QIPCRTR ? domain : AF_MSM_IPC, type, protocol);
++	int fd = real_socket(domain != AF_QIPCRTR ? domain : AF_MSM_IPC, type, protocol);
++
++	if (fd >= 0 && domain == AF_QIPCRTR)
++		get_socket_state(fd, 1);
++	return fd;
+ }
+ 
+ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+@@ -79,13 +153,17 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+ 	// getsockname() on AF_MSM_IPC causes 'Unable to handle kernel NULL pointer dereference at virtual address 00000000'
+ 	if (is_socket_msm_ipc(sockfd)) {
++		struct socket_state *state = get_socket_state(sockfd, 1);
+ 		// we have to lookup with an ioctl to get the node and port we're on
+ 		struct {
+ 			struct server_lookup_args lookup_args;
+ 			struct msm_ipc_server_info srv_info;
+ 		} ioctl_args = {
+ 			.lookup_args = {
+-				.port_name = { .service = g_service, .instance = g_instance, },
++				.port_name = {
++					.service = state ? state->service : 0,
++					.instance = state ? state->instance : 0,
++				},
+ 				.num_entries_in_array = 1,
+ 			},
+ 		};
+@@ -123,6 +201,7 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct
+ 		const struct qrtr_ctrl_pkt *qrtr_ctrl_pkt = buf;
+ 
+ 		if (dest_addr_qrtr->sq_node == IPC_ROUTER_NID_LOCAL && dest_addr_qrtr->sq_port == QRTR_PORT_CTRL &&
++			len >= sizeof(*qrtr_ctrl_pkt) &&
+ 			qrtr_ctrl_pkt->cmd == QRTR_TYPE_NEW_SERVER) {
+ 
+ 			// translate to bind()
+@@ -142,29 +221,344 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct
+ 				// leave bind()'s errno for caller
+ 				return -1;
+ 			}
+-			g_service = qrtr_ctrl_pkt->server.service;
+-			g_instance = qrtr_ctrl_pkt->server.instance;
++			struct socket_state *state = get_socket_state(sockfd, 1);
++			if (state) {
++				pthread_mutex_lock(&state->lock);
++				state->service = qrtr_ctrl_pkt->server.service;
++				state->instance = qrtr_ctrl_pkt->server.instance;
++				pthread_mutex_unlock(&state->lock);
++			}
+ 			return len; // indicate whole packet was sent
+ 		}
+ 
++		if (dest_addr_qrtr->sq_node == IPC_ROUTER_NID_LOCAL &&
++			dest_addr_qrtr->sq_port == QRTR_PORT_CTRL &&
++			len >= sizeof(*qrtr_ctrl_pkt) &&
++			qrtr_ctrl_pkt->cmd == QRTR_TYPE_NEW_LOOKUP) {
++			struct socket_state *state = get_socket_state(sockfd, 1);
++			uint32_t first_service = qrtr_ctrl_pkt->server.service;
++			uint32_t last_service = first_service;
++			int wildcard = !first_service && !qrtr_ctrl_pkt->server.instance;
++
++			if (!state) {
++				errno = ENOBUFS;
++				return -1;
++			}
++			if (wildcard) {
++				first_service = 1;
++				last_service = MAX_QMI_SERVICE;
++			}
++
++			pthread_mutex_lock(&state->lock);
++			state->pending_head = 0;
++			state->pending_count = 0;
++			for (uint32_t service = first_service; service <= last_service; service++) {
++				struct {
++					struct server_lookup_args lookup_args;
++					struct msm_ipc_server_info srv_info;
++				} ioctl_args = {
++					.lookup_args = {
++						.port_name = {
++							.service = service,
++							.instance = qrtr_ctrl_pkt->server.instance,
++						},
++						.num_entries_in_array = 1,
++					},
++				};
++
++				if (ioctl(sockfd, IPC_ROUTER_IOCTL_LOOKUP_SERVER, &ioctl_args) < 0 ||
++					ioctl_args.lookup_args.num_entries_found != 1)
++					continue;
++
++				state->pending[state->pending_count++] = (struct qrtr_ctrl_pkt) {
++					.cmd = QRTR_TYPE_NEW_SERVER,
++					.server = {
++						.service = service,
++						.instance = qrtr_ctrl_pkt->server.instance,
++						.node = ioctl_args.srv_info.node_id,
++						.port = ioctl_args.srv_info.port_id,
++					},
++				};
++			}
++
++			if (wildcard)
++				state->pending[state->pending_count++] = (struct qrtr_ctrl_pkt) {
++					.cmd = QRTR_TYPE_NEW_SERVER,
++				};
++			pthread_mutex_unlock(&state->lock);
++			return len;
++		}
++
+ 		return real_sendto(sockfd, buf, len, flags, (const struct sockaddr*)&sami, sizeof(sami));
+ 	} else {
+ 		return real_sendto(sockfd, buf, len, flags, dest_addr, addrlen);
+ 	}
+ }
+ 
+-ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr *src_addr, socklen_t *addrlen) {
+-	ssize_t sz;
+-	struct sockaddr_msm_ipc sami;
+-	socklen_t sami_len = sizeof(sami);
++static ssize_t result_size(size_t copied, size_t full, int flags)
++{
++	return flags & MSG_TRUNC ? full : copied;
++}
++
++static void copy_source(struct sockaddr *dst, socklen_t *dst_len,
++			const struct sockaddr_qrtr *source)
++{
++	if (!dst || !dst_len)
++		return;
++	memcpy(dst, source, min(*dst_len, sizeof(*source)));
++	*dst_len = sizeof(*source);
++}
++
++static size_t copy_to_iov(const unsigned char *source, size_t len,
++			  const struct iovec *iov, size_t iovlen)
++{
++	size_t copied = 0;
++
++	for (size_t i = 0; i < iovlen && copied < len; i++) {
++		size_t chunk = min(iov[i].iov_len, len - copied);
++		memcpy(iov[i].iov_base, source + copied, chunk);
++		copied += chunk;
++	}
++	return copied;
++}
++
++static ssize_t receive_pending(int sockfd, void *buf, size_t len, int flags,
++			       struct sockaddr *source, socklen_t *source_len)
++{
++	struct socket_state *state = get_socket_state(sockfd, 0);
++	struct sockaddr_qrtr control = {
++		.sq_family = AF_QIPCRTR,
++		.sq_node = IPC_ROUTER_NID_LOCAL,
++		.sq_port = QRTR_PORT_CTRL,
++	};
++	size_t copied;
++
++	if (!state)
++		return NO_QUEUED_DATAGRAM;
++	pthread_mutex_lock(&state->lock);
++	if (state->pending_head >= state->pending_count) {
++		pthread_mutex_unlock(&state->lock);
++		return NO_QUEUED_DATAGRAM;
++	}
++
++	copied = min(len, sizeof(state->pending[state->pending_head]));
++	memcpy(buf, &state->pending[state->pending_head], copied);
++	if (!(flags & MSG_PEEK)) {
++		state->pending_head++;
++		if (state->pending_head == state->pending_count)
++			state->pending_head = state->pending_count = 0;
++	}
++	pthread_mutex_unlock(&state->lock);
++	copy_source(source, source_len, &control);
++	return result_size(copied, sizeof(struct qrtr_ctrl_pkt), flags);
++}
++
++/* Called with state->lock held. */
++static ssize_t cache_next_datagram(struct socket_state *state, int flags)
++{
++	struct sockaddr_msm_ipc source;
++	socklen_t source_len = sizeof(source);
++	ssize_t size;
++
++	if (state->peeked_size)
++		return state->peeked_size;
++
++	size = real_recvfrom(state->fd, state->peeked, sizeof(state->peeked),
++			     flags & ~MSG_PEEK, (struct sockaddr *)&source, &source_len);
++	if (size < 0)
++		return size;
++	if (!translate_addr_msmipc2qipcrtr((const struct sockaddr *)&source,
++					   &state->peeked_source)) {
++		errno = EAFNOSUPPORT;
++		return -1;
++	}
++	state->peeked_size = size;
++	return size;
++}
++
++static ssize_t receive_cached(int sockfd, void *buf, size_t len, int flags,
++			      struct sockaddr *source, socklen_t *source_len,
++			      int fill_cache)
++{
++	struct socket_state *state = get_socket_state(sockfd, fill_cache);
++	ssize_t full;
++	size_t copied;
++
++	if (!state)
++		return NO_QUEUED_DATAGRAM;
++	pthread_mutex_lock(&state->lock);
++	if (!state->peeked_size && fill_cache) {
++		full = cache_next_datagram(state, flags);
++		if (full < 0) {
++			pthread_mutex_unlock(&state->lock);
++			return full;
++		}
++	}
++	if (!state->peeked_size) {
++		pthread_mutex_unlock(&state->lock);
++		return NO_QUEUED_DATAGRAM;
++	}
++
++	full = state->peeked_size;
++	copied = min(len, state->peeked_size);
++	memcpy(buf, state->peeked, copied);
++	copy_source(source, source_len, &state->peeked_source);
++	if (!(flags & MSG_PEEK))
++		state->peeked_size = 0;
++	pthread_mutex_unlock(&state->lock);
++	return result_size(copied, full, flags);
++}
++
++ssize_t recv(int sockfd, void *buf, size_t len, int flags)
++{
++	ssize_t size = receive_pending(sockfd, buf, len, flags, NULL, NULL);
++
++	if (size != NO_QUEUED_DATAGRAM)
++		return size;
++	size = receive_cached(sockfd, buf, len, flags, NULL, NULL,
++			      (flags & MSG_PEEK) && is_socket_msm_ipc(sockfd));
++	if (size != NO_QUEUED_DATAGRAM)
++		return size;
++	return real_recv(sockfd, buf, len, flags);
++}
+ 
+-	sz = real_recvfrom(sockfd, buf, len, flags, (struct sockaddr*)&sami, &sami_len);
++ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
++		 struct sockaddr *src_addr, socklen_t *addrlen)
++{
++	struct sockaddr_msm_ipc source;
++	socklen_t source_len = sizeof(source);
++	ssize_t size;
+ 
+-	if (translate_addr_msmipc2qipcrtr((const struct sockaddr *)&sami, (struct sockaddr_qrtr *)src_addr)) {
+-		*addrlen = sizeof(struct sockaddr_qrtr);
++	size = receive_pending(sockfd, buf, len, flags, src_addr, addrlen);
++	if (size != NO_QUEUED_DATAGRAM)
++		return size;
++	size = receive_cached(sockfd, buf, len, flags, src_addr, addrlen,
++			      (flags & MSG_PEEK) && is_socket_msm_ipc(sockfd));
++	if (size != NO_QUEUED_DATAGRAM)
++		return size;
++
++	size = real_recvfrom(sockfd, buf, len, flags,
++			     src_addr ? (struct sockaddr *)&source : NULL,
++			     src_addr ? &source_len : NULL);
++	if (size >= 0 && src_addr && addrlen) {
++		struct sockaddr_qrtr qrtr_source;
++		if (translate_addr_msmipc2qipcrtr((const struct sockaddr *)&source,
++						   &qrtr_source))
++			copy_source(src_addr, addrlen, &qrtr_source);
++	}
++	return size;
++}
++
++ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags)
++{
++	unsigned char buffer[MAX_PEEKED_MESSAGE_SIZE];
++	struct sockaddr_msm_ipc source;
++	void *caller_name = msg->msg_name;
++	socklen_t caller_name_len = msg->msg_namelen;
++	ssize_t size;
++	size_t copied;
++
++	size = receive_pending(sockfd, buffer, sizeof(buffer), flags,
++			       (struct sockaddr *)msg->msg_name, &msg->msg_namelen);
++	if (size >= 0)
++		goto copy_buffer;
++	if (size != NO_QUEUED_DATAGRAM)
++		return size;
++	size = receive_cached(sockfd, buffer, sizeof(buffer), flags,
++			      (struct sockaddr *)msg->msg_name, &msg->msg_namelen,
++			      (flags & MSG_PEEK) && is_socket_msm_ipc(sockfd));
++	if (size >= 0)
++		goto copy_buffer;
++	if (size != NO_QUEUED_DATAGRAM)
++		return size;
++
++	if (!is_socket_msm_ipc(sockfd))
++		return real_recvmsg(sockfd, msg, flags);
++	msg->msg_name = caller_name ? &source : NULL;
++	msg->msg_namelen = caller_name ? sizeof(source) : 0;
++	size = real_recvmsg(sockfd, msg, flags);
++	msg->msg_name = caller_name;
++	if (size >= 0 && caller_name) {
++		struct sockaddr_qrtr qrtr_source;
++		if (translate_addr_msmipc2qipcrtr((const struct sockaddr *)&source,
++						   &qrtr_source))
++			copy_source(caller_name, &caller_name_len, &qrtr_source);
++		msg->msg_namelen = caller_name_len;
+ 	}
++	return size;
+ 
+-	return sz;
++copy_buffer:
++	copied = copy_to_iov(buffer, size, msg->msg_iov, msg->msg_iovlen);
++	msg->msg_controllen = 0;
++	msg->msg_flags = copied < (size_t)size ? MSG_TRUNC : 0;
++	return result_size(copied, size, flags);
++}
++
++static int mark_pending(struct pollfd *fds, nfds_t nfds)
++{
++	int ready = 0;
++
++	for (nfds_t i = 0; i < nfds; i++) {
++		struct socket_state *state = get_socket_state(fds[i].fd, 0);
++		if (!state)
++			continue;
++		pthread_mutex_lock(&state->lock);
++		if (state->pending_head < state->pending_count) {
++			fds[i].revents |= POLLIN;
++			ready++;
++		}
++		pthread_mutex_unlock(&state->lock);
++	}
++	return ready;
++}
++
++int poll(struct pollfd *fds, nfds_t nfds, int timeout)
++{
++	if (mark_pending(fds, nfds)) {
++		int result = real_poll(fds, nfds, 0);
++		if (result < 0)
++			return result;
++		mark_pending(fds, nfds);
++		result = 0;
++		for (nfds_t i = 0; i < nfds; i++)
++			result += !!fds[i].revents;
++		return result;
++	}
++	return real_poll(fds, nfds, timeout);
++}
++
++int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout,
++	  const sigset_t *sigmask)
++{
++	if (mark_pending(fds, nfds)) {
++		const struct timespec zero = { 0, 0 };
++		int result = real_ppoll(fds, nfds, &zero, sigmask);
++		if (result < 0)
++			return result;
++		mark_pending(fds, nfds);
++		result = 0;
++		for (nfds_t i = 0; i < nfds; i++)
++			result += !!fds[i].revents;
++		return result;
++	}
++	return real_ppoll(fds, nfds, timeout, sigmask);
++}
++
++int close(int fd)
++{
++	struct socket_state *state = get_socket_state(fd, 0);
++	int result = real_close(fd);
++
++	if (!result && state) {
++		pthread_mutex_lock(&states_lock);
++		pthread_mutex_lock(&state->lock);
++		state->in_use = 0;
++		state->pending_head = state->pending_count = 0;
++		state->peeked_size = 0;
++		pthread_mutex_unlock(&state->lock);
++		pthread_mutex_unlock(&states_lock);
++	}
++	return result;
+ }
+ 
+ /* helpers */
+-- 
+2.51.0
+

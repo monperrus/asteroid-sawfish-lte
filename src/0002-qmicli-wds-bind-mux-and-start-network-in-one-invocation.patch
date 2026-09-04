@@ -1,0 +1,154 @@
+diff --git a/src/qmicli/qmicli-wds.c b/src/qmicli/qmicli-wds.c
+index 0bae3b4..070f0b1 100644
+--- a/src/qmicli/qmicli-wds.c
++++ b/src/qmicli/qmicli-wds.c
+@@ -357,7 +357,8 @@ qmicli_wds_options_enabled (void)
+                  !!set_lte_attach_pdn_list_str +
+                  noop_flag);
+ 
+-    if (n_actions > 1) {
++    if (n_actions > 1 &&
++        !(n_actions == 2 && bind_mux_str && start_network_str)) {
+         g_printerr ("error: too many WDS actions requested\n");
+         exit (EXIT_FAILURE);
+     } else if (n_actions == 0 &&
+@@ -764,6 +765,11 @@ out:
+     return success;
+ }
+ 
++#if defined HAVE_QMI_MESSAGE_WDS_GET_CURRENT_SETTINGS
++static void get_current_settings_ready (QmiClientWds *client,
++                                        GAsyncResult *res);
++#endif
++
+ static void
+ start_network_ready (QmiClientWds *client,
+                      GAsyncResult *res)
+@@ -826,6 +832,29 @@ start_network_ready (QmiClientWds *client,
+              qmi_device_get_path_display (ctx->device),
+              (guint)ctx->packet_data_handle);
+ 
++#if defined HAVE_QMI_MESSAGE_WDS_GET_CURRENT_SETTINGS
++    {
++        QmiMessageWdsGetCurrentSettingsInput *input;
++
++        input = qmi_message_wds_get_current_settings_input_new ();
++        qmi_message_wds_get_current_settings_input_set_requested_settings (
++            input,
++            (QMI_WDS_REQUESTED_SETTINGS_DNS_ADDRESS  |
++             QMI_WDS_REQUESTED_SETTINGS_IP_ADDRESS   |
++             QMI_WDS_REQUESTED_SETTINGS_GATEWAY_INFO |
++             QMI_WDS_REQUESTED_SETTINGS_MTU          |
++             QMI_WDS_REQUESTED_SETTINGS_IP_FAMILY),
++            NULL);
++        qmi_client_wds_get_current_settings (client,
++                                             input,
++                                             10,
++                                             ctx->cancellable,
++                                             (GAsyncReadyCallback)get_current_settings_ready,
++                                             NULL);
++        qmi_message_wds_get_current_settings_input_unref (input);
++    }
++#endif
++
+ #if defined HAVE_QMI_MESSAGE_WDS_STOP_NETWORK && defined HAVE_QMI_MESSAGE_WDS_GET_PACKET_SERVICE_STATUS
+     if (follow_network_flag) {
+         g_print ("\nCtrl+C will stop the network\n");
+@@ -842,7 +871,32 @@ start_network_ready (QmiClientWds *client,
+ #endif
+ 
+     /* Nothing else to do */
+-    operation_shutdown (TRUE);
++    if (!follow_network_flag)
++        operation_shutdown (TRUE);
++}
++
++static void
++start_network (void)
++{
++    QmiMessageWdsStartNetworkInput *input = NULL;
++    GError *error = NULL;
++
++    if (!start_network_input_create (start_network_str, &input, &error)) {
++        g_printerr ("error: %s\n", error->message);
++        g_error_free (error);
++        operation_shutdown (FALSE);
++        return;
++    }
++
++    g_debug ("Asynchronously starting network...");
++    qmi_client_wds_start_network (ctx->client,
++                                  input,
++                                  180,
++                                  ctx->cancellable,
++                                  (GAsyncReadyCallback)start_network_ready,
++                                  NULL);
++    if (input)
++        qmi_message_wds_start_network_input_unref (input);
+ }
+ 
+ #endif /* HAVE_QMI_MESSAGE_WDS_START_NETWORK */
+@@ -987,7 +1041,8 @@ get_current_settings_ready (QmiClientWds *client,
+     }
+ 
+     qmi_message_wds_get_current_settings_output_unref (output);
+-    operation_shutdown (TRUE);
++    if (!follow_network_flag)
++        operation_shutdown (TRUE);
+ }
+ 
+ #endif /* HAVE_QMI_MESSAGE_WDS_GET_CURRENT_SETTINGS */
+@@ -2805,6 +2860,14 @@ bind_mux_data_port_ready (QmiClientWds *client,
+     }
+ 
+     qmi_message_wds_bind_mux_data_port_output_unref (output);
++
++#if defined HAVE_QMI_MESSAGE_WDS_START_NETWORK
++    if (start_network_str) {
++        start_network ();
++        return;
++    }
++#endif
++
+     operation_shutdown (TRUE);
+ }
+ 
+@@ -3106,25 +3169,8 @@ qmicli_wds_run (QmiDevice *device,
+     ctx->packet_status_timeout_id = 0;
+ 
+ #if defined HAVE_QMI_MESSAGE_WDS_START_NETWORK
+-    if (start_network_str) {
+-        QmiMessageWdsStartNetworkInput *input = NULL;
+-        GError *error = NULL;
+-
+-        if (!start_network_input_create (start_network_str, &input, &error)) {
+-            g_printerr ("error: %s\n", error->message);
+-            g_error_free (error);
+-            return;
+-        }
+-
+-        g_debug ("Asynchronously starting network...");
+-        qmi_client_wds_start_network (ctx->client,
+-                                      input,
+-                                      180,
+-                                      ctx->cancellable,
+-                                      (GAsyncReadyCallback)start_network_ready,
+-                                      NULL);
+-        if (input)
+-            qmi_message_wds_start_network_input_unref (input);
++    if (start_network_str && !bind_mux_str) {
++        start_network ();
+         return;
+     }
+ #endif /* HAVE_QMI_MESSAGE_WDS_START_NETWORK */
+@@ -3183,6 +3229,10 @@ qmicli_wds_run (QmiDevice *device,
+ 
+         g_debug ("Binding mux data port..");
+         input = bind_mux_data_port_input_create (bind_mux_str);
++        if (!input) {
++            operation_shutdown (FALSE);
++            return;
++        }
+         qmi_client_wds_bind_mux_data_port (client,
+                                            input,
+                                            10,

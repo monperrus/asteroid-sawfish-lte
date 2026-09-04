@@ -1,0 +1,11 @@
+[Unit]
+Description=Disarm modem firmware at boot (LTE bring-up safety net)
+DefaultDependencies=no
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'rm -f /lib/firmware/mba.mbn /lib/firmware/modem.*'
+
+[Install]
+WantedBy=sysinit.target

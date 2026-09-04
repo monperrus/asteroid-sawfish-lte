@@ -1,0 +1,18 @@
+CC ?= cc
+CFLAGS ?= -O2 -g
+CFLAGS += -std=c99 -Wall -Wextra -Werror
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/sbin
+
+all: msm-rmnet-ctl
+
+msm-rmnet-ctl: msm-rmnet-ctl.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $<
+
+install: msm-rmnet-ctl
+	install -D -m 0755 msm-rmnet-ctl $(DESTDIR)$(BINDIR)/msm-rmnet-ctl
+
+clean:
+	rm -f msm-rmnet-ctl
+
+.PHONY: all clean install

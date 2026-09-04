@@ -1,0 +1,32 @@
+# This repository shares its working directory with the cross-build tree the
+# binaries in bin/ come from (libqmi, rmtfs, libqipcrtr4msmipc, an armhf
+# sysroot, straces, ~500 MB in total). That tree is regenerable and is not
+# checked in, so the rule here is deny-by-default: everything is ignored
+# unless it is named below.
+/*
+
+!/.gitignore
+!/LICENSE
+!/README.md
+
+!/install-lte.sh
+!/99-lte-modem.rules
+!/lte-bearer.default
+
+!/lte-bearer
+!/lte-modem-arm
+!/lte-modem-disarm
+!/lte-modem-hold
+!/lte-soak
+!/lte-soak-report
+!/at_cmd.sh
+!/send_sms.sh
+
+!/lte-rmtfs.service
+!/lte-modem.service
+!/lte-bearer.service
+!/lte-firmware-disarm.service
+!/lte-soak@.service
+
+!/bin/
+!/src/
