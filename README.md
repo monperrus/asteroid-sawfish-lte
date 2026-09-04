@@ -7,9 +7,7 @@ out of the box and the one documented attempt at booting it put the watch
 into a reboot loop.
 
 This repository contains the step-by-step procedure, the three systemd units
-that package it, and the tools they need. Upstream tracks cellular on this
-device as "bad" in
-[meta-smartwatch#340](https://github.com/AsteroidOS/meta-smartwatch/issues/340).
+that package it, and the tools they need. 
 
 What works today, verified on a live Tele2 SE SIM:
 
@@ -19,25 +17,9 @@ What works today, verified on a live Tele2 SE SIM:
 - SMS sends and receives over the AT control plane, with no data bearer.
 
 What does not:
-
-- **Nothing is enabled at boot.** The battery cost has not been measured, and
-  this device has a history of a firmware-triggered reboot loop. See
-  [The battery soak](#the-battery-soak).
-- ofono and ConnMan do not know LTE exists, so the AsteroidOS network
-  settings UI does not either. The bearer is owned by `lte-bearer.service`.
-- IPv6 is untested. Voice calls need the audio path, see
-  [asteroid-sawfish-audio](https://github.com/monperrus/asteroid-sawfish-audio).
-
 Everything below assumes `adb` access to the watch as root, which is the
 default for `adb shell`.
 
-## Licensing
-
-MIT (see `LICENSE`), except where a file says otherwise: the `rmtfs` and
-`libqipcrtr4msmipc` fixes are patches against GPL/BSD upstreams and carry
-those projects' licences.
-
----
 
 ## How this works, in one picture
 
@@ -233,7 +215,7 @@ before suspecting the network.
 
 ---
 
-## Why each step is load-bearing
+## Warnings
 
 Every one of these was a separate failure during bring-up. None is optional.
 
@@ -267,7 +249,7 @@ and the *next* symptom you see is `/dev/modem-at` failing to open with
 `Connection timed out` — which reads like an unrelated SMD fault and is
 thoroughly misleading.
 
-### `ONLINE` is not readiness — gate on QMI, and set operating mode
+### `ONLINE` is not readiness
 
 `lte-modem-hold` is `Type=notify` and signals ready only after three things,
 in order, because each is ready well before the next:
@@ -282,7 +264,7 @@ in order, because each is ready well before the next:
    only symptom is the bearer failing 120 s later with `generic-no-service`,
    which reads like a config fault but is not.
 
-### DPM opens the control port — that is what creates `rmnet0`
+### DPM opens the control port, creates `rmnet0`
 
 The vendor `/system/etc/data/netmgr_config.xml` identifies this SoC as the
 `feero` profile: control port `DATA5_CNTL`, hardware endpoint `bam-dmux`
@@ -389,7 +371,7 @@ Two details that are easy to get wrong:
   is to the bearer's own file — the original is then gone. The bearer records
   the link *target* and restores the symlink on stop.
 
-### Stopping cleanly
+## Stopping cleanly
 
 `qmicli` stops the call on `SIGINT` ("Ctrl+C will stop the network") and
 ignores `SIGTERM`. So the bearer sends `SIGINT` to its child and waits up to
@@ -400,101 +382,18 @@ halfway through, leaving routes and `/etc/resolv.conf` behind.
 
 ---
 
-## Troubleshooting
+## Upstream
 
-| Symptom | Cause |
+Three of the fixes below are proposed upstream, and the rmnet tool is
+published as a project of its own:
+
+| | |
 |---|---|
-| `/dev/modem-at`: `Connection timed out` | the modem is not powered — the subsys holder died. `systemctl status lte-modem` |
-| `lte-rmtfs.service` never starts | `/dev/qcom_rmtfs_uio1` missing; the udev rules are not applied |
-| TX counters rise, RX stays 0 | `rmnet0` is still Ethernet-mode, or WDA disagrees with DPM |
-| `OutOfCall` from `--wds-get-current-settings` | you are asking from a process that does not own the call; read `journalctl -u lte-bearer` instead |
-| `Unknown client N for service wds` | a CID from an exited process; QRTR already dropped it |
-| `crash_count` climbing | check `restart_level` is `RELATED`, and that `rmtfs` was up *before* the modem |
-| modem restarts after touching rmtfs | never restart `rmtfs` under a live modem; stop the whole chain and replay |
-| `node with id 0 not found in QRTR bus` | started before QMI registered; the readiness gate in `lte-modem-hold` exists for this |
-| `CallFailed` / `generic-no-service` | not registered yet, or the modem is not in `online` operating mode |
-| `rmnetcli` "Aborted (core dumped)" | a glibc `LD_PRELOAD` leaked into a bionic binary |
-| all traffic dies when the bearer comes up | the metric-0 `default dev rmnet0` route is back |
-| `systemctl stop` hangs in `deactivating` | `qmicli` needs `SIGINT`, and `KillMode` must be `mixed` |
-| SMS never arrives | `+CNMI` is not armed, or you are listing the wrong `+CPMS` store |
-| nothing survives a reboot | by design — `lte-firmware-disarm.service` |
+| [linux-msm/rmtfs#41](https://github.com/linux-msm/rmtfs/pull/41) | `sharedmem: accept relative buffer offsets` (open) |
+| [scintill/libqipcrtr4msmipc#1](https://github.com/scintill/libqipcrtr4msmipc/pull/1) | `support QRTR client lookups on MSM IPC` (open) |
+| [libqmi!472](https://gitlab.freedesktop.org/mobile-broadband/libqmi/-/merge_requests/472) | `qmicli: dpm: allow zero hardware pipe IDs` |
+| [msm-rmnet-tools](https://gitlab.com/monperrus/msm-rmnet-tools) | new: `msm-rmnet-ctl` for the legacy MSM RmNet ioctl API |
 
----
-
-## Three things that must never be done
-
-- **Never leave `restart_level` at `SYSTEM` with firmware armed.** A routine
-  modem crash then resets the whole watch, and since the firmware is still on
-  disk it does it again. That is the reboot loop.
-- **Never restart `rmtfs` while the modem is up.** Stop the whole chain and
-  replay it.
-- **Never hold `/dev/subsys_modem` from a shell, a scope, or `nohup`.** All
-  three get reaped and power the modem down at a moment you will not connect
-  to the symptom.
-
----
-
-## Files
-
-| File | What it does |
-| --- | --- |
-| `install-lte.sh` | Step 1. Pushes everything to the watch over `adb`. Idempotent. |
-| `lte-rmtfs.service` | Serves EFS to the modem. Must be up before the modem boots. |
-| `lte-modem.service` | Arms firmware and holds the modem powered; readiness = QMI answers. |
-| `lte-bearer.service` | The data bearer: DPM, WDA, rmnet, the WDS call, IP config. |
-| `lte-firmware-disarm.service` | The safety net. Empties `/lib/firmware` at every boot. |
-| `lte-modem-arm` / `lte-modem-disarm` | `restart_level`, then copy firmware out of a read-only mount of the stock `modem` partition. |
-| `lte-modem-hold` | Holds `/dev/subsys_modem` open and gates readiness on QMI. |
-| `lte-bearer` | The bearer itself, configured by `/etc/default/lte-bearer`. |
-| `lte-bearer.default` | Shipped `/etc/default/lte-bearer`. APN goes here. |
-| `99-lte-modem.rules` | `/dev/modem`, `/dev/modem-at`, `/dev/qcom_rmtfs_uio1`. |
-| `at_cmd.sh` | Sends AT commands to `/dev/modem-at` and prints what comes back. |
-| `send_sms.sh` | One SMS in text mode, including the `>`-prompt/Ctrl-Z dance. |
-| `lte-soak` / `lte-soak@.service` / `lte-soak-report` | The battery A/B measurement. |
-| `bin/rmtfs` | Mainline `rmtfs`, patched. Serves EFS over the IPC router. |
-| `bin/libqipcrtr4msmipc.so` | `AF_QIPCRTR`→`AF_MSM_IPC` shim, patched. This is what lets mainline QMI userspace run on a downstream 3.18 kernel. |
-| `bin/libsmdpkt_wrapper.so` | Unmodified upstream shim. Anything touching `/dev/modem-at` needs it preloaded. |
-| `bin/qmicli-lte` + `bin/libqmi-glib.so.5`, `bin/libqrtr-glib.so.0` | Patched `qmicli`. Stock `qmicli` cannot do what the bearer needs. |
-| `bin/msm-rmnet-ctl` | Reads the BAM pipe pair and switches `rmnet0` to raw-IP. Static. |
-| `src/` | The patched sources and the upstream submissions, see below. |
-
-Everything under `bin/` is cross-built for `armv7vehf-neon`
-(`-march=armv7-a -mfpu=neon-vfpv4 -mfloat-abi=hard`) and stripped. The build
-tree they come from is large and regenerable, so it is not checked in — this
-repository's `.gitignore` is deny-by-default for exactly that reason.
-
-### The patches behind the binaries
-
-| Patch | Why | Source |
-|---|---|---|
-| `rmtfs`: accept a shared-memory *offset*, not only an absolute address ([PR #41](https://github.com/linux-msm/rmtfs/pull/41)) | this firmware sends `phys_offset=0x200` for sector 1; upstream read it as an absolute address and rejected every EFS transfer | `src/0003-*.patch`, `src/sharedmem.c` |
-| `libqipcrtr4msmipc`: answer `QRTR_TYPE_NEW_LOOKUP`, including wildcard enumeration and the all-zero end-of-dump marker | the original shim supports a service *registering* itself (what `rmtfs` needs) but not a client *looking one up* (what `qrtr-glib` needs) | `src/0004-*.patch`, `src/libqipcrtr4msmipc.c` |
-| `libqipcrtr4msmipc`: `ppoll()` readiness plus a one-datagram peek cache | target GLib waits with `ppoll()` and probes with `MSG_PEEK`; AF_MSM_IPC's `MSG_PEEK` is destructive, so `qmicli` lost every immediate response | `src/0004-*.patch`, `src/libqipcrtr4msmipc.c` |
-| `libqmi`: separate presence flag for DPM endpoint number 0 | this kernel reports `consumer=0, producer=0`, which stock `qmicli` cannot distinguish from "unset" | `src/0001-*.patch` |
-| `libqmi`: allow `--wds-bind-mux-data-port` and `--wds-start-network` in one invocation | the bind and the call must share one WDS client; this is a local diagnostic patch, not upstream material | `src/0002-*.patch` |
-
-The numbered `src/*.patch` files are the versions proposed upstream;
-`src/sharedmem.c` and `src/libqipcrtr4msmipc.c` are the working sources the
-shipped binaries were actually built from, which say the same thing less
-tidily. `src/msm-rmnet-ctl.c` and `src/Makefile.msm-rmnet-ctl` build
-`bin/msm-rmnet-ctl`:
-
-```sh
-make -f Makefile.msm-rmnet-ctl CC=arm-linux-gnueabihf-gcc LDFLAGS=-static
-```
-
-`src/set-rmnet-llp.c` is the one-ioctl precursor to that tool, kept because
-it is the smallest possible reproduction of the raw-IP fix.
-
-Once QMI works over QRTR, this modem registers its services natively on the
-IPC router (all on node 0): `WDS`→port 42, `DMS`→port 50, `NAS`→port 36,
-`WMS`→port 38, `UIM`→port 41. That is the durable finding — the mainline
-QMI-over-QRTR approach is architecturally viable on a downstream MSM kernel,
-independently of the `smdcntl0`/`qmuxd` dead end. `/dev/smdcntl0` is *not* a
-usable path here: on Android that channel is only opened once the vendor's
-`qmuxd` negotiates it, and no vendor daemon is running.
-
----
 
 ## The battery soak
 
@@ -531,39 +430,6 @@ device awake and measure itself.
 A wake-lock named `ipc000000e9_qmicli-lte` is already visible in
 `wakeup_sources` while the bearer runs. That is the thing to watch.
 
-### Result so far: worn baseline, modem down (2026-08-31)
-
-The control half of the A/B, and on its own already the more important
-number:
-
-```text
-96% -> 5% in 6.30 h        =  14.45 %/h
-projected runtime          =  ~6.9 h from full
-current_avg                =  68 mA mean, 64 mA median
-voltage                    =  4.25 V -> 3.25 V
-```
-
-**The watch lasts under 7 hours worn with the modem off.** Whatever the modem
-costs is a delta on top of a platform that already drains this fast, so "does
-LTE hurt battery life" is a smaller question than it looked.
-
-Two methodology findings from that run:
-
-- **`SOAK_INTERVAL` is a lower bound, not a cadence.** At 120 s the median gap
-  was ~16 min and only 16% of the expected samples appeared: the device
-  suspends and the timer does not fire until something else wakes it. That is
-  the right behaviour — sampling on a forced schedule would keep the device
-  awake and measure the sampler — and rates come from the recorded
-  timestamps, so sparse data is still sound. Do not "fix" it with a wake
-  alarm.
-- **Runs end abruptly.** This one stopped at 5% battery and never wrote its
-  closing `wakeup_sources` snapshot. The sampler now writes it from a signal
-  handler and refreshes a `.wakeup.last` every ~10 samples; the report falls
-  back to that.
-
-The modem-up half has not been run. Until it has, the units stay disabled at
-boot and `lte-firmware-disarm.service` stays enabled.
-
 ---
 
 ## Still open
@@ -576,6 +442,12 @@ boot and `lte-firmware-disarm.service` stays enabled.
   (`qmi-endpoint-qrtr.c` already exists upstream) before going near that.
 - **IPv6.** Untested.
 - **Voice calls.** They need the speaker and microphone path, which is
-  separate work; the modem bring-up here is the shared prerequisite.
+  separate work; the modem bring-up here is the shared prerequisite, see https://github.com/monperrus/asteroid-sawfish-audio
 - **A proper Yocto layer.** This installs over `adb` into `/usr/local`; it is
   not a meta-smartwatch recipe yet.
+
+## Licensing
+
+MIT (see `LICENSE`), except where a file says otherwise: the `rmtfs` and
+`libqipcrtr4msmipc` fixes are patches against GPL/BSD upstreams and carry
+those projects' licences.
