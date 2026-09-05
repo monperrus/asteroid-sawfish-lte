@@ -53,11 +53,17 @@ finish() {
 trap 'finish; exit 0' INT TERM
 
 echo "label=$LABEL interval=${INTERVAL}s duration=${DURATION}s -> $CSV"
-echo "ts,iso,uptime_s,capacity,charge_now,voltage_now,current_now,current_avg,temp,status,usb,modem_state,crash_count,bearer,rmnet_rx,rmnet_tx" > "$CSV"
+echo "ts,iso,uptime_s,capacity,charge_now,voltage_now,current_now,current_avg,temp,status,usb,modem_state,crash_count,bearer,rmnet_rx,rmnet_tx,card,pa,afe_opens" > "$CSV"
 
 END=$(( $(date +%s) + DURATION ))
 while [ "$(date +%s)" -lt "$END" ]; do
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    # afe_opens counts audio-path open events in the kernel ring buffer. The
+    # ring wraps, so it is not monotonic across a long run -- the useful
+    # quantity is the delta between samples, i.e. how often PulseAudio is
+    # re-opening the card while nothing plays. Read passively: do NOT ask
+    # pactl, because connecting a client to PulseAudio can itself resume a
+    # parked sink and destroy the condition being measured.
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$(date +%s)" "$(date -Iseconds)" \
         "$(cut -d. -f1 /proc/uptime)" \
         "$(r $PS/battery/capacity)" \
@@ -73,6 +79,9 @@ while [ "$(date +%s)" -lt "$END" ]; do
         "$(systemctl is-active lte-bearer 2>/dev/null)" \
         "$(r /sys/class/net/rmnet_data0/statistics/rx_bytes)" \
         "$(r /sys/class/net/rmnet_data0/statistics/tx_bytes)" \
+        "$(sed -n 's/^ *0 \[\([^ ]*\).*/\1/p' /proc/asound/cards 2>/dev/null | head -1)" \
+        "$(pgrep -c pulseaudio 2>/dev/null || echo 0)" \
+        "$(dmesg 2>/dev/null | grep -c msm8952_tfa98xx_i2c_gpio_request)" \
         >> "$CSV"
 
     # Stop early rather than silently logging charger-fed samples.
