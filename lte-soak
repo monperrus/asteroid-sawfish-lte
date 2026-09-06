@@ -40,6 +40,25 @@ if [ "${SOAK_FORCE:-0}" != "1" ] \
     exit 1
 fi
 
+# Blank the display before the first sample. This device has mce's
+# inhibit_blank_mode set, so an untouched watch keeps its display on for as
+# long as it is up: run 3 held mce_display_on for 100.4% of its duration and
+# never suspended once, which measured the panel rather than the thing under
+# test. Blanking here makes a soak valid whatever mce is configured to do.
+# SOAK_KEEP_DISPLAY=1 for the rare run that is deliberately about the display.
+if [ "${SOAK_KEEP_DISPLAY:-0}" != "1" ] && command -v mcetool >/dev/null 2>&1; then
+    mcetool --blank-screen >/dev/null 2>&1 || true
+    # mce blanks asynchronously, so poll rather than assume a fixed delay.
+    i=0
+    while [ $i -lt 15 ]; do
+        case "$(awk '$1 == "mce_display_on" { print $6 }' "$WAKEUP" 2>/dev/null)" in
+        0|"") break ;;
+        esac
+        i=$((i + 1)); sleep 1
+    done
+    [ $i -ge 15 ] && echo "warning: display still on after 15 s; run is suspect" >&2
+fi
+
 cp "$WAKEUP" "$BASE.wakeup.start" 2>/dev/null || true
 
 # A soak often ends abruptly -- flat battery, a low-battery shutdown, someone
@@ -69,7 +88,7 @@ while [ "$(date +%s)" -lt "$END" ]; do
     # re-opening the card while nothing plays. Read passively: do NOT ask
     # pactl, because connecting a client to PulseAudio can itself resume a
     # parked sink and destroy the condition being measured.
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$(date +%s)" "$(date -Iseconds)" \
         "$(cut -d. -f1 /proc/uptime)" \
         "$(r $PS/battery/capacity)" \
