@@ -53,10 +53,16 @@ finish() {
 trap 'finish; exit 0' INT TERM
 
 echo "label=$LABEL interval=${INTERVAL}s duration=${DURATION}s -> $CSV"
-echo "ts,iso,uptime_s,capacity,charge_now,voltage_now,current_now,current_avg,temp,status,usb,modem_state,crash_count,bearer,rmnet_rx,rmnet_tx,card,pa,afe_opens" > "$CSV"
+echo "ts,iso,uptime_s,capacity,charge_now,voltage_now,current_now,current_avg,temp,status,usb,modem_state,crash_count,bearer,rmnet_rx,rmnet_tx,card,pa,afe_opens,disp" > "$CSV"
 
 END=$(( $(date +%s) + DURATION ))
 while [ "$(date +%s)" -lt "$END" ]; do
+    # disp is 1 while mce holds mce_display_on. On a watch that boots and is
+    # never touched, mce takes that lock ~15 s into boot and never releases it,
+    # so the display stays on for the whole run and the device never suspends.
+    # That silently cost run 3 its idle measurement; record it rather than
+    # discover it in the wakeup_sources diff afterwards.
+    #
     # afe_opens counts audio-path open events in the kernel ring buffer. The
     # ring wraps, so it is not monotonic across a long run -- the useful
     # quantity is the delta between samples, i.e. how often PulseAudio is
@@ -79,9 +85,10 @@ while [ "$(date +%s)" -lt "$END" ]; do
         "$(systemctl is-active lte-bearer 2>/dev/null)" \
         "$(r /sys/class/net/rmnet_data0/statistics/rx_bytes)" \
         "$(r /sys/class/net/rmnet_data0/statistics/tx_bytes)" \
-        "$(sed -n 's/^ *0 \[\([^ ]*\).*/\1/p' /proc/asound/cards 2>/dev/null | head -1)" \
-        "$(pgrep -c pulseaudio 2>/dev/null || echo 0)" \
+        "$(sed -n 's/^ *0 \[\([^]]*\)\].*/\1/p' /proc/asound/cards 2>/dev/null | head -1)" \
+        "$(pgrep pulseaudio 2>/dev/null | wc -l)" \
         "$(dmesg 2>/dev/null | grep -c msm8952_tfa98xx_i2c_gpio_request)" \
+        "$(awk '$1 == "mce_display_on" { print ($6 > 0) ? 1 : 0 }' "$WAKEUP" 2>/dev/null)" \
         >> "$CSV"
 
     # Stop early rather than silently logging charger-fed samples.

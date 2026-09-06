@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two LTE battery soak runs. See "The battery soak" in README.md.
 
-Usage:  lte-soak-report <baseline.csv> <modem-up.csv>
+Usage:  lte-soak-report <run-a.csv> <run-b.csv>
 
 Reports drain per hour for each run and diffs the wakeup_sources snapshots
 that sit beside each CSV, so a wake-lock regression shows up by name.
@@ -72,7 +72,13 @@ def summarize(path: Path) -> dict:
 
 
 def wakeups(csv_path: Path) -> dict[str, int]:
-    """active_since deltas per wakeup source, start -> end."""
+    """total_time deltas per wakeup source, start -> end.
+
+    total_time is cumulative held time, so the delta is how long each source
+    was held *during this run* -- which is the question. active_since is the
+    wrong column here: it is only meaningful for a source still held at the
+    snapshot, and reads as zero for everything else.
+    """
     base = str(csv_path)[: -len(".csv")] if str(csv_path).endswith(".csv") else str(csv_path)
     snaps = {}
     for which in ("start", "end"):
@@ -87,7 +93,9 @@ def wakeups(csv_path: Path) -> dict[str, int]:
                 f = line.split()
                 if len(f) >= 7:
                     try:
-                        table[f[0]] = int(f[6])  # active_since
+                        # name active_count event_count wakeup_count
+                        # expire_count active_since total_time ...
+                        table[f[0]] = int(f[6])  # total_time
                     except ValueError:
                         pass
         snaps[which] = table
@@ -99,12 +107,23 @@ def fmt(v, unit="", nd=2):
     return "n/a" if v is None else f"{v:.{nd}f}{unit}"
 
 
+def run_label(path: Path) -> str:
+    """The label lte-soak was given, recovered from soak-<label>-<stamp>.csv.
+
+    Runs are no longer only modem-down vs modem-up -- printing those two
+    headings over an audio A/B is how you misread your own data.
+    """
+    parts = path.stem.split("-")
+    return "-".join(parts[1:-2]) if len(parts) > 3 and parts[0] == "soak" else path.stem
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         sys.exit(__doc__)
     a, b = summarize(Path(sys.argv[1])), summarize(Path(sys.argv[2]))
+    la, lb = run_label(Path(sys.argv[1])), run_label(Path(sys.argv[2]))
 
-    print(f"{'':22} {'baseline':>18} {'modem up':>18}")
+    print(f"{'':22} {la:>18} {lb:>18}")
     print("-" * 60)
     rows = [
         ("samples", str(a["samples"]), str(b["samples"])),
@@ -132,9 +151,9 @@ def main() -> None:
 
     wa, wb = wakeups(Path(sys.argv[1])), wakeups(Path(sys.argv[2]))
     if wa or wb:
-        print("\nwakeup sources active during the run (ms, top 12 by modem-up):")
+        print(f"\nwakeup sources held during the run (ms, top 12 by {lb}):")
         keys = sorted(set(wa) | set(wb), key=lambda k: -wb.get(k, 0))[:12]
-        print(f"  {'source':32} {'baseline':>12} {'modem up':>12}")
+        print(f"  {'source':32} {la:>12} {lb:>12}")
         for k in keys:
             print(f"  {k:32} {wa.get(k, 0):>12} {wb.get(k, 0):>12}")
 
